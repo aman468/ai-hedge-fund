@@ -56,6 +56,10 @@ node_modules
 # Outputs
 outputs/
 /scratchpad/
+reports/
+
+# Claude Code local memory / hooks
+.claude/
 
 # Database files (users will have their own local databases)
 *.db

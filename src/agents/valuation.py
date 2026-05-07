@@ -42,6 +42,7 @@ def valuation_analyst_agent(state: AgentState, agent_id: str = "valuation_analys
             progress.update_status(agent_id, ticker, "Failed: No financial metrics found")
             continue
         most_recent_metrics = financial_metrics[0]
+        currency = most_recent_metrics.currency or "USD"
 
         # --- Enhanced line‑items ---
         progress.update_status(agent_id, ticker, "Gathering comprehensive line items")
@@ -87,6 +88,7 @@ def valuation_analyst_agent(state: AgentState, agent_id: str = "valuation_analys
             capex=li_curr.capital_expenditure,
             working_capital_change=wc_change,
             growth_rate=most_recent_metrics.earnings_growth or 0.05,
+            currency=currency,
         )
 
         # Enhanced Discounted Cash Flow with WACC and scenarios
@@ -99,6 +101,7 @@ def valuation_analyst_agent(state: AgentState, agent_id: str = "valuation_analys
             cash=getattr(li_curr, 'cash_and_equivalents', None),
             interest_coverage=most_recent_metrics.interest_coverage,
             debt_to_equity=most_recent_metrics.debt_to_equity,
+            currency=currency,
         )
         
         # Prepare FCF history for enhanced DCF
@@ -117,7 +120,8 @@ def valuation_analyst_agent(state: AgentState, agent_id: str = "valuation_analys
             },
             wacc=wacc,
             market_cap=most_recent_metrics.market_cap or 0,
-            revenue_growth=most_recent_metrics.revenue_growth
+            revenue_growth=most_recent_metrics.revenue_growth,
+            currency=currency,
         )
         
         dcf_val = dcf_results['expected_value']
@@ -131,6 +135,7 @@ def valuation_analyst_agent(state: AgentState, agent_id: str = "valuation_analys
             net_income=li_curr.net_income,
             price_to_book_ratio=most_recent_metrics.price_to_book_ratio,
             book_value_growth=most_recent_metrics.book_value_growth or 0.03,
+            currency=currency,
         )
 
         # ------------------------------------------------------------------
@@ -223,6 +228,30 @@ def valuation_analyst_agent(state: AgentState, agent_id: str = "valuation_analys
 # Helper Valuation Functions
 #############################
 
+def _market_rates(currency: str) -> dict:
+    """Damodaran-calibrated parameters by reporting currency.
+
+    INR: India G-Sec 7 %, India ERP 7.5 %, nominal terminal growth 5.5 %.
+    USD: US Treasury 4.5 %, US ERP 6 %, terminal growth 3 %.
+    """
+    if currency == "INR":
+        return {
+            "risk_free": 0.07,
+            "erp": 0.075,
+            "terminal_growth": 0.055,
+            "wacc_floor": 0.10,
+            "wacc_cap": 0.25,
+            "large_cap_threshold": 1_000_000_000_000,  # ₹1 trillion
+        }
+    return {
+        "risk_free": 0.045,
+        "erp": 0.06,
+        "terminal_growth": 0.03,
+        "wacc_floor": 0.06,
+        "wacc_cap": 0.20,
+        "large_cap_threshold": 50_000_000_000,  # $50 billion
+    }
+
 def calculate_owner_earnings_value(
     net_income: float | None,
     depreciation: float | None,
@@ -232,8 +261,9 @@ def calculate_owner_earnings_value(
     required_return: float = 0.15,
     margin_of_safety: float = 0.25,
     num_years: int = 5,
+    currency: str = "USD",
 ) -> float:
-    """Buffett owner‑earnings valuation with margin‑of‑safety."""
+    """Buffett owner‑earnings valuation with margin‑of‑safety, currency-aware terminal growth."""
     if not all(isinstance(x, (int, float)) for x in [net_income, depreciation, capex, working_capital_change]):
         return 0
 
@@ -241,12 +271,14 @@ def calculate_owner_earnings_value(
     if owner_earnings <= 0:
         return 0
 
+    rates = _market_rates(currency)
+
     pv = 0.0
     for yr in range(1, num_years + 1):
         future = owner_earnings * (1 + growth_rate) ** yr
         pv += future / (1 + required_return) ** yr
 
-    terminal_growth = min(growth_rate, 0.03)
+    terminal_growth = min(growth_rate, rates["terminal_growth"])
     term_val = (owner_earnings * (1 + growth_rate) ** num_years * (1 + terminal_growth)) / (
         required_return - terminal_growth
     )
@@ -259,23 +291,28 @@ def calculate_owner_earnings_value(
 def calculate_intrinsic_value(
     free_cash_flow: float | None,
     growth_rate: float = 0.05,
-    discount_rate: float = 0.10,
-    terminal_growth_rate: float = 0.02,
+    discount_rate: float | None = None,
+    terminal_growth_rate: float | None = None,
     num_years: int = 5,
+    currency: str = "USD",
 ) -> float:
-    """Classic DCF on FCF with constant growth and terminal value."""
+    """Classic DCF on FCF — discount and terminal growth default to currency-calibrated rates."""
     if free_cash_flow is None or free_cash_flow <= 0:
         return 0
+
+    rates = _market_rates(currency)
+    dr = discount_rate if discount_rate is not None else (rates["risk_free"] + rates["erp"])
+    tg = terminal_growth_rate if terminal_growth_rate is not None else rates["terminal_growth"]
 
     pv = 0.0
     for yr in range(1, num_years + 1):
         fcft = free_cash_flow * (1 + growth_rate) ** yr
-        pv += fcft / (1 + discount_rate) ** yr
+        pv += fcft / (1 + dr) ** yr
 
     term_val = (
-        free_cash_flow * (1 + growth_rate) ** num_years * (1 + terminal_growth_rate)
-    ) / (discount_rate - terminal_growth_rate)
-    pv_term = term_val / (1 + discount_rate) ** num_years
+        free_cash_flow * (1 + growth_rate) ** num_years * (1 + tg)
+    ) / (dr - tg)
+    pv_term = term_val / (1 + dr) ** num_years
 
     return pv + pv_term
 
@@ -304,28 +341,31 @@ def calculate_residual_income_value(
     net_income: float | None,
     price_to_book_ratio: float | None,
     book_value_growth: float = 0.03,
-    cost_of_equity: float = 0.10,
-    terminal_growth_rate: float = 0.03,
+    cost_of_equity: float | None = None,
+    terminal_growth_rate: float | None = None,
     num_years: int = 5,
+    currency: str = "USD",
 ):
-    """Residual Income Model (Edwards‑Bell‑Ohlson)."""
+    """Residual Income Model (Edwards‑Bell‑Ohlson) — currency-calibrated cost of equity."""
     if not (market_cap and net_income and price_to_book_ratio and price_to_book_ratio > 0):
         return 0
 
+    rates = _market_rates(currency)
+    ke = cost_of_equity if cost_of_equity is not None else (rates["risk_free"] + rates["erp"])
+    tg = terminal_growth_rate if terminal_growth_rate is not None else rates["terminal_growth"]
+
     book_val = market_cap / price_to_book_ratio
-    ri0 = net_income - cost_of_equity * book_val
+    ri0 = net_income - ke * book_val
     if ri0 <= 0:
         return 0
 
     pv_ri = 0.0
     for yr in range(1, num_years + 1):
         ri_t = ri0 * (1 + book_value_growth) ** yr
-        pv_ri += ri_t / (1 + cost_of_equity) ** yr
+        pv_ri += ri_t / (1 + ke) ** yr
 
-    term_ri = ri0 * (1 + book_value_growth) ** (num_years + 1) / (
-        cost_of_equity - terminal_growth_rate
-    )
-    pv_term = term_ri / (1 + cost_of_equity) ** num_years
+    term_ri = ri0 * (1 + book_value_growth) ** (num_years + 1) / (ke - tg)
+    pv_term = term_ri / (1 + ke) ** num_years
 
     intrinsic = book_val + pv_ri + pv_term
     return intrinsic * 0.8  # 20% margin of safety
@@ -342,35 +382,34 @@ def calculate_wacc(
     interest_coverage: float | None,
     debt_to_equity: float | None,
     beta_proxy: float = 1.0,
-    risk_free_rate: float = 0.045,
-    market_risk_premium: float = 0.06
+    currency: str = "USD",
 ) -> float:
-    """Calculate WACC using available financial data."""
-    
+    """Calculate WACC — risk-free rate and ERP calibrated to reporting currency."""
+    rates = _market_rates(currency)
+    risk_free_rate = rates["risk_free"]
+    market_risk_premium = rates["erp"]
+
     # Cost of Equity (CAPM)
     cost_of_equity = risk_free_rate + beta_proxy * market_risk_premium
-    
-    # Cost of Debt - estimate from interest coverage
+
+    # Cost of Debt — estimated from interest coverage
     if interest_coverage and interest_coverage > 0:
-        # Higher coverage = lower cost of debt
         cost_of_debt = max(risk_free_rate + 0.01, risk_free_rate + (10 / interest_coverage))
     else:
-        cost_of_debt = risk_free_rate + 0.05  # Default spread
-    
-    # Weights
+        cost_of_debt = risk_free_rate + 0.05
+
+    # Capital structure weights
     net_debt = max((total_debt or 0) - (cash or 0), 0)
     total_value = market_cap + net_debt
-    
+
     if total_value > 0:
         weight_equity = market_cap / total_value
         weight_debt = net_debt / total_value
-        
-        # Tax shield (assume 25% corporate tax rate)
         wacc = (weight_equity * cost_of_equity) + (weight_debt * cost_of_debt * 0.75)
     else:
         wacc = cost_of_equity
-    
-    return min(max(wacc, 0.06), 0.20)  # Floor 6%, cap 20%
+
+    return min(max(wacc, rates["wacc_floor"]), rates["wacc_cap"])
 
 
 def calculate_fcf_volatility(fcf_history: list[float]) -> float:
@@ -396,55 +435,49 @@ def calculate_enhanced_dcf_value(
     growth_metrics: dict,
     wacc: float,
     market_cap: float,
-    revenue_growth: float | None = None
+    revenue_growth: float | None = None,
+    currency: str = "USD",
 ) -> float:
-    """Enhanced DCF with multi-stage growth."""
-    
+    """Enhanced DCF with multi-stage growth — currency-aware terminal growth and large-cap threshold."""
     if not fcf_history or fcf_history[0] <= 0:
         return 0
-    
-    # Analyze FCF trend and quality
+
+    rates = _market_rates(currency)
+
     fcf_current = fcf_history[0]
     fcf_avg_3yr = sum(fcf_history[:3]) / min(3, len(fcf_history))
     fcf_volatility = calculate_fcf_volatility(fcf_history)
-    
+
     # Stage 1: High Growth (Years 1-3)
-    # Use revenue growth but cap based on business maturity
     high_growth = min(revenue_growth or 0.05, 0.25) if revenue_growth else 0.05
-    if market_cap > 50_000_000_000:  # Large cap
+    if market_cap > rates["large_cap_threshold"]:
         high_growth = min(high_growth, 0.10)
-    
+
     # Stage 2: Transition (Years 4-7)
-    transition_growth = (high_growth + 0.03) / 2
-    
-    # Stage 3: Terminal (steady state)
-    terminal_growth = min(0.03, high_growth * 0.6)
-    
-    # Project FCF with stages
+    transition_growth = (high_growth + rates["terminal_growth"]) / 2
+
+    # Stage 3: Terminal — country-calibrated ceiling
+    terminal_growth = min(rates["terminal_growth"], high_growth * 0.6)
+
     pv = 0
-    base_fcf = max(fcf_current, fcf_avg_3yr * 0.85)  # Conservative base
-    
-    # High growth stage
+    base_fcf = max(fcf_current, fcf_avg_3yr * 0.85)
+
     for year in range(1, 4):
         fcf_projected = base_fcf * (1 + high_growth) ** year
         pv += fcf_projected / (1 + wacc) ** year
-    
-    # Transition stage
+
     for year in range(4, 8):
-        transition_rate = transition_growth * (8 - year) / 4  # Declining
+        transition_rate = transition_growth * (8 - year) / 4
         fcf_projected = base_fcf * (1 + high_growth) ** 3 * (1 + transition_rate) ** (year - 3)
         pv += fcf_projected / (1 + wacc) ** year
-    
-    # Terminal value
+
     final_fcf = base_fcf * (1 + high_growth) ** 3 * (1 + transition_growth) ** 4
     if wacc <= terminal_growth:
-        terminal_growth = wacc * 0.8  # Adjust if invalid
+        terminal_growth = wacc * 0.8
     terminal_value = (final_fcf * (1 + terminal_growth)) / (wacc - terminal_growth)
     pv_terminal = terminal_value / (1 + wacc) ** 7
-    
-    # Quality adjustment based on FCF volatility
+
     quality_factor = max(0.7, 1 - (fcf_volatility * 0.5))
-    
     return (pv + pv_terminal) * quality_factor
 
 
@@ -453,42 +486,35 @@ def calculate_dcf_scenarios(
     growth_metrics: dict,
     wacc: float,
     market_cap: float,
-    revenue_growth: float | None = None
+    revenue_growth: float | None = None,
+    currency: str = "USD",
 ) -> dict:
-    """Calculate DCF under multiple scenarios."""
-    
+    """Calculate DCF under multiple scenarios — passes currency to enhanced DCF."""
     scenarios = {
-        'bear': {'growth_adj': 0.5, 'wacc_adj': 1.2, 'terminal_adj': 0.8},
-        'base': {'growth_adj': 1.0, 'wacc_adj': 1.0, 'terminal_adj': 1.0},
-        'bull': {'growth_adj': 1.5, 'wacc_adj': 0.9, 'terminal_adj': 1.2}
+        'bear': {'growth_adj': 0.5, 'wacc_adj': 1.2},
+        'base': {'growth_adj': 1.0, 'wacc_adj': 1.0},
+        'bull': {'growth_adj': 1.5, 'wacc_adj': 0.9},
     }
-    
+
     results = {}
     base_revenue_growth = revenue_growth or 0.05
-    
+
     for scenario, adjustments in scenarios.items():
-        adjusted_revenue_growth = base_revenue_growth * adjustments['growth_adj']
-        adjusted_wacc = wacc * adjustments['wacc_adj']
-        
         results[scenario] = calculate_enhanced_dcf_value(
             fcf_history=fcf_history,
             growth_metrics=growth_metrics,
-            wacc=adjusted_wacc,
+            wacc=wacc * adjustments['wacc_adj'],
             market_cap=market_cap,
-            revenue_growth=adjusted_revenue_growth
+            revenue_growth=base_revenue_growth * adjustments['growth_adj'],
+            currency=currency,
         )
-    
-    # Probability-weighted average
-    expected_value = (
-        results['bear'] * 0.2 + 
-        results['base'] * 0.6 + 
-        results['bull'] * 0.2
-    )
-    
+
+    expected_value = results['bear'] * 0.2 + results['base'] * 0.6 + results['bull'] * 0.2
+
     return {
         'scenarios': results,
         'expected_value': expected_value,
         'range': results['bull'] - results['bear'],
         'upside': results['bull'],
-        'downside': results['bear']
+        'downside': results['bear'],
     }

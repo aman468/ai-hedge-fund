@@ -528,13 +528,29 @@ def calculate_intrinsic_value(financial_line_items: list) -> dict[str, any]:
     # Enhanced DCF with more realistic assumptions
     details = []
 
+    # Currency-calibrated DCF rates (Damodaran-consistent)
+    currency = getattr(financial_line_items[0], "currency", "USD") if financial_line_items else "USD"
+    if currency == "INR":
+        growth_cap_s1   = 0.15   # Indian companies sustain higher growth longer
+        growth_cap_s2   = 0.07
+        terminal_growth = 0.055  # India long-run nominal GDP (Damodaran)
+        discount_rate   = 0.13   # Buffett quality filter at India cost of equity
+        default_growth  = 0.05
+        growth_ceiling  = 0.25
+    else:
+        growth_cap_s1   = 0.08
+        growth_cap_s2   = 0.04
+        terminal_growth = 0.025
+        discount_rate   = 0.10
+        default_growth  = 0.03
+        growth_ceiling  = 0.15
+
     # Estimate growth rate based on historical performance (more conservative)
     historical_earnings = []
-    for item in financial_line_items[:5]:  # Last 5 years
+    for item in financial_line_items[:5]:
         if hasattr(item, 'net_income') and item.net_income:
             historical_earnings.append(item.net_income)
 
-    # Calculate historical growth rate
     if len(historical_earnings) >= 3:
         oldest_earnings = historical_earnings[-1]
         latest_earnings = historical_earnings[0]
@@ -542,25 +558,15 @@ def calculate_intrinsic_value(financial_line_items: list) -> dict[str, any]:
 
         if oldest_earnings > 0:
             historical_growth = ((latest_earnings / oldest_earnings) ** (1 / years)) - 1
-            # Conservative adjustment - cap growth and apply haircut
-            historical_growth = max(-0.05, min(historical_growth, 0.15))  # Cap between -5% and 15%
-            conservative_growth = historical_growth * 0.7  # Apply 30% haircut for conservatism
+            historical_growth = max(-0.05, min(historical_growth, growth_ceiling))
+            conservative_growth = historical_growth * 0.7  # 30% haircut for conservatism
         else:
-            conservative_growth = 0.03  # Default 3% if negative base
+            conservative_growth = default_growth
     else:
-        conservative_growth = 0.03  # Default conservative growth
+        conservative_growth = default_growth
 
-    # Buffett's conservative assumptions
-    stage1_growth = min(conservative_growth, 0.08)  # Stage 1: cap at 8%
-    stage2_growth = min(conservative_growth * 0.5, 0.04)  # Stage 2: half of stage 1, cap at 4%
-    terminal_growth = 0.025  # Long-term GDP growth rate
-
-    # Risk-adjusted discount rate based on business quality
-    base_discount_rate = 0.09  # Base 9%
-
-    # Adjust based on analysis scores (if available in calling context)
-    # For now, use conservative 10%
-    discount_rate = 0.10
+    stage1_growth = min(conservative_growth, growth_cap_s1)
+    stage2_growth = min(conservative_growth * 0.5, growth_cap_s2)
 
     # Three-stage DCF model
     stage1_years = 5  # High growth phase

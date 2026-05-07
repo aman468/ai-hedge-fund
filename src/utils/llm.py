@@ -1,10 +1,60 @@
 """Helper functions for LLM"""
 
 import json
+import threading
 from pydantic import BaseModel
+from langchain_core.callbacks import UsageMetadataCallbackHandler
 from src.llm.models import get_model, get_model_info
 from src.utils.progress import progress
 from src.graph.state import AgentState
+
+# ── Session-level token accumulator (thread-safe) ─────────────────────────────
+_lock = threading.Lock()
+_usage: dict[str, int] = {"input": 0, "output": 0, "calls": 0}
+
+# Approximate cost per 1M tokens (USD) — update when model pricing changes
+_COST_PER_1M = {
+    "claude-opus-4-7":   {"input": 15.0,  "output": 75.0},
+    "claude-sonnet-4-6": {"input": 3.0,   "output": 15.0},
+    "claude-haiku-4-5":  {"input": 0.80,  "output": 4.0},
+    "gpt-4.1":           {"input": 2.0,   "output": 8.0},
+    "gpt-4o":            {"input": 2.5,   "output": 10.0},
+    "deepseek-v4-pro":   {"input": 0.27,  "output": 1.10},
+    "gemini-3.1-pro-preview": {"input": 1.25, "output": 5.0},
+}
+_DEFAULT_COST = {"input": 3.0, "output": 15.0}
+
+
+def reset_token_usage():
+    """Reset the session counter (call before each run)."""
+    with _lock:
+        _usage["input"] = 0
+        _usage["output"] = 0
+        _usage["calls"] = 0
+
+
+def get_token_usage() -> dict:
+    with _lock:
+        return dict(_usage)
+
+
+def print_token_summary(model_name: str = ""):
+    """Print a cost/token summary for the completed run."""
+    with _lock:
+        inp, out, calls = _usage["input"], _usage["output"], _usage["calls"]
+    if calls == 0:
+        return
+    rates = _COST_PER_1M.get(model_name, _DEFAULT_COST)
+    cost = (inp * rates["input"] + out * rates["output"]) / 1_000_000
+    print(f"\n{'─'*48}")
+    print(f"  Token usage  ({model_name or 'unknown model'})")
+    print(f"{'─'*48}")
+    print(f"  LLM calls  : {calls}")
+    print(f"  Input      : {inp:>10,} tokens")
+    print(f"  Output     : {out:>10,} tokens")
+    print(f"  Total      : {inp+out:>10,} tokens")
+    print(f"  Est. cost  : ${cost:.4f}")
+    print(f"{'─'*48}\n")
 
 
 def call_llm(
@@ -48,6 +98,11 @@ def call_llm(
     model_info = get_model_info(model_name, model_provider)
     llm = get_model(model_name, model_provider, api_keys)
 
+    # Bind usage-tracking callback before structured-output wrapping so it
+    # fires at the raw LLM layer regardless of the chain wrapper.
+    usage_handler = UsageMetadataCallbackHandler()
+    llm = llm.with_config({"callbacks": [usage_handler]})
+
     # For non-JSON support models, we can use structured output
     if not (model_info and not model_info.has_json_mode()):
         llm = llm.with_structured_output(
@@ -60,6 +115,17 @@ def call_llm(
         try:
             # Call the LLM
             result = llm.invoke(prompt)
+
+            # Accumulate token usage from callback
+            # usage_metadata is {model_name: {"input_tokens": X, "output_tokens": Y, ...}}
+            inp, out = 0, 0
+            for model_stats in (usage_handler.usage_metadata or {}).values():
+                inp += model_stats.get("input_tokens", 0) or 0
+                out += model_stats.get("output_tokens", 0) or 0
+            with _lock:
+                _usage["input"]  += inp
+                _usage["output"] += out
+                _usage["calls"]  += 1
 
             # For non-JSON support models, we need to extract and parse the JSON manually
             if model_info and not model_info.has_json_mode():

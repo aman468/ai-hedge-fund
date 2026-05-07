@@ -26,7 +26,7 @@ class AswathDamodaranSignal(BaseModel):
 
 def aswath_damodaran_agent(state: AgentState, agent_id: str = "aswath_damodaran_agent"):
     """
-    Analyze US equities through Aswath Damodaran's intrinsic-value lens:
+    Analyze Indian and global equities through Aswath Damodaran's intrinsic-value lens:
       • Cost of Equity via CAPM (risk-free + β·ERP)
       • 5-yr revenue / FCFF growth trends & reinvestment efficiency
       • FCFF-to-Firm DCF → equity value → per-share intrinsic value
@@ -239,8 +239,9 @@ def analyze_risk_profile(metrics: list, line_items: list) -> dict[str, any]:
     else:
         details.append("Interest coverage NA")
 
-    # Compute cost of equity for later use
-    cost_of_equity = estimate_cost_of_equity(beta)
+    # Compute cost of equity for later use — currency-aware
+    currency = getattr(metrics[0], "currency", "USD") if metrics else "USD"
+    cost_of_equity = estimate_cost_of_equity(beta, currency=currency)
 
     return {
         "score": score,
@@ -248,6 +249,7 @@ def analyze_risk_profile(metrics: list, line_items: list) -> dict[str, any]:
         "details": "; ".join(details),
         "beta": beta,
         "cost_of_equity": cost_of_equity,
+        "currency": currency,
     }
 
 
@@ -284,11 +286,17 @@ def analyze_relative_valuation(metrics: list) -> dict[str, any]:
 # ────────────────────────────────────────────────────────────────────────────────
 def calculate_intrinsic_value_dcf(metrics: list, line_items: list, risk_analysis: dict) -> dict[str, any]:
     """
-    FCFF DCF with:
-      • Base FCFF = latest free cash flow
-      • Growth = 5-yr revenue CAGR (capped 12 %)
-      • Fade linearly to terminal growth 2.5 % by year 10
-      • Discount @ cost of equity (no debt split given data limitations)
+    FCFF DCF with currency-aware assumptions (INR vs USD).
+
+    INR (India):
+      • Growth capped at 22 % (Indian companies sustain higher growth longer)
+      • Terminal growth 5.5 % (India's long-run nominal GDP, Damodaran)
+      • Fallback growth 7 % (India macro base)
+    USD (US / other):
+      • Growth capped at 12 %
+      • Terminal growth 2.5 %
+      • Fallback growth 4 %
+    Discount @ cost of equity from CAPM (already currency-calibrated in risk_analysis).
     """
     if not metrics or len(metrics) < 2 or not line_items:
         return {"intrinsic_value": None, "details": ["Insufficient data"]}
@@ -299,30 +307,39 @@ def calculate_intrinsic_value_dcf(metrics: list, line_items: list, risk_analysis
     if not fcff0 or not shares:
         return {"intrinsic_value": None, "details": ["Missing FCFF or share count"]}
 
-    # Growth assumptions
-    revs = [m.revenue for m in reversed(metrics) if m.revenue]
-    if len(revs) >= 2 and revs[0] > 0:
-        base_growth = min((revs[-1] / revs[0]) ** (1 / (len(revs) - 1)) - 1, 0.12)
-    else:
-        base_growth = 0.04  # fallback
+    currency = getattr(latest_m, "currency", "USD")
 
-    terminal_growth = 0.025
+    if currency == "INR":
+        growth_cap     = 0.22    # Indian blue-chips routinely sustain 15-20 % revenue growth
+        terminal_growth = 0.055  # India nominal GDP long-run (Damodaran)
+        fallback_growth = 0.07   # India macro fallback
+    else:
+        growth_cap     = 0.12
+        terminal_growth = 0.025
+        fallback_growth = 0.04
+
     years = 10
 
-    # Discount rate
-    discount = risk_analysis.get("cost_of_equity") or 0.09
+    # Growth: 5-yr revenue CAGR, capped by market ceiling
+    revs = [m.revenue for m in reversed(metrics) if m.revenue]
+    if len(revs) >= 2 and revs[0] > 0:
+        base_growth = min((revs[-1] / revs[0]) ** (1 / (len(revs) - 1)) - 1, growth_cap)
+    else:
+        base_growth = fallback_growth
 
-    # Project FCFF and discount
+    # Discount rate from CAPM (already calibrated to INR or USD in risk_analysis)
+    discount = risk_analysis.get("cost_of_equity") or (0.145 if currency == "INR" else 0.09)
+
+    # Project FCFF, fading growth linearly to terminal by year 10
     pv_sum = 0.0
     g = base_growth
     g_step = (terminal_growth - base_growth) / (years - 1)
     for yr in range(1, years + 1):
         fcff_t = fcff0 * (1 + g)
-        pv = fcff_t / (1 + discount) ** yr
-        pv_sum += pv
+        pv_sum += fcff_t / (1 + discount) ** yr
         g += g_step
 
-    # Terminal value (perpetuity with terminal growth)
+    # Terminal value
     tv = (
         fcff0
         * (1 + terminal_growth)
@@ -337,20 +354,29 @@ def calculate_intrinsic_value_dcf(metrics: list, line_items: list, risk_analysis
         "intrinsic_value": equity_value,
         "intrinsic_per_share": intrinsic_per_share,
         "assumptions": {
+            "currency": currency,
             "base_fcff": fcff0,
             "base_growth": base_growth,
             "terminal_growth": terminal_growth,
             "discount_rate": discount,
             "projection_years": years,
         },
-        "details": ["FCFF DCF completed"],
+        "details": [f"FCFF DCF completed ({currency}-calibrated)"],
     }
 
 
-def estimate_cost_of_equity(beta: float | None) -> float:
-    """CAPM: r_e = r_f + β × ERP (use Damodaran's long-term averages)."""
-    risk_free = 0.04          # 10-yr US Treasury proxy
-    erp = 0.05                # long-run US equity risk premium
+def estimate_cost_of_equity(beta: float | None, currency: str = "USD") -> float:
+    """CAPM: r_e = r_f + β × ERP, calibrated to reporting currency.
+
+    INR rates: Damodaran Jan 2025 — India G-Sec 7 %, India ERP 7.5 %.
+    USD rates: 10-yr Treasury 4 %, US long-run ERP 5 %.
+    """
+    if currency == "INR":
+        risk_free = 0.07     # 10-yr India G-Sec yield
+        erp = 0.075          # India equity risk premium (Damodaran estimate)
+    else:
+        risk_free = 0.04     # 10-yr US Treasury
+        erp = 0.05           # US long-run equity risk premium
     beta = beta if beta is not None else 1.0
     return risk_free + beta * erp
 
@@ -375,7 +401,11 @@ def generate_damodaran_output(
             (
                 "system",
                 """You are Aswath Damodaran, Professor of Finance at NYU Stern.
-                Use your valuation framework to issue trading signals on US equities.
+                Use your valuation framework to issue trading signals on Indian and global equities.
+                When the reporting currency is INR, use India-calibrated assumptions:
+                  risk-free rate 7 % (10-yr G-Sec), equity risk premium 7.5 %, terminal growth 5.5 %.
+                When the reporting currency is USD, use US assumptions:
+                  risk-free rate 4 %, equity risk premium 5 %, terminal growth 2.5 %.
 
                 Speak with your usual clear, data-driven tone:
                   ◦ Start with the company "story" (qualitatively)

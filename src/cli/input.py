@@ -221,6 +221,7 @@ class CLIInputs:
     margin_requirement: float
     show_reasoning: bool = False
     show_agent_graph: bool = False
+    report_dir: str = "reports"
     raw_args: Optional[argparse.Namespace] = None
 
 
@@ -260,6 +261,14 @@ def parse_cli_inputs(
     if include_graph_flag:
         parser.add_argument("--show-agent-graph", action="store_true", help="Show the agent graph")
 
+    parser.add_argument(
+        "--report-dir",
+        dest="report_dir",
+        type=str,
+        default="reports",
+        help="Directory to save the markdown report (default: reports)",
+    )
+
     args = parser.parse_args()
 
     # Normalize parsed values
@@ -282,6 +291,7 @@ def parse_cli_inputs(
         margin_requirement=getattr(args, "margin_requirement", 0.0),
         show_reasoning=getattr(args, "show_reasoning", False),
         show_agent_graph=getattr(args, "show_agent_graph", False),
+        report_dir=getattr(args, "report_dir", "reports"),
         raw_args=args,
     )
 
